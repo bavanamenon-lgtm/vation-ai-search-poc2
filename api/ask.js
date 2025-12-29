@@ -1,168 +1,75 @@
 // api/ask.js
-// OmniOne / Vation AI Search POC - backend (Vercel)
-// - Fetches a few public pages from siteBaseUrl (different for core/cx/ex)
-// - Sends SMALL grounded excerpts to Gemini (cheap, fast)
-// - Forces short output: 1 line + 5 bullets (~<=120 words)
-// - Handles CORS + OPTIONS (Tampermonkey friendly)
-// - Retries once on 429/5xx
-// - In-memory cache (POC)
+// OmniOne / Vation AI Search POC
+// Gemini-only summarization (NO hardcoded answers)
+// Ultra-low quota design for demos
 
 const CACHE = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
+const TTL = 5 * 60 * 1000; // 5 min cache
 
-function now() { return Date.now(); }
-
-function cacheGet(key) {
-  const hit = CACHE.get(key);
-  if (!hit) return null;
-  if (now() - hit.ts > CACHE_TTL_MS) {
-    CACHE.delete(key);
-    return null;
-  }
-  return hit.data;
-}
-function cacheSet(key, data) { CACHE.set(key, { ts: now(), data }); }
-
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+function json(res, code, data) {
+  res.status(code).setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(data));
 }
 
-function safeJson(res, status, obj) {
-  setCors(res);
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(obj));
-}
-
-function stripHtml(html) {
-  if (!html) return "";
+function strip(html = "") {
   return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<\/?[^>]+(>|$)/g, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<\/?[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function detectPreset(question = "", preset = "") {
-  const p = (preset || "").toLowerCase().trim();
-  if (p === "cx" || p === "ex" || p === "core") return p;
-
-  const q = (question || "").toLowerCase();
-  if (q.includes("customer experience") || /\bcx\b/.test(q)) return "cx";
-  if (q.includes("employee experience") || /\bex\b/.test(q)) return "ex";
-  return "core";
+async function fetchPage(url) {
+  const r = await fetch(url, {
+    headers: { "User-Agent": "OmniOne-POC" },
+  });
+  if (!r.ok) throw new Error(`Fetch failed ${r.status}`);
+  return strip(await r.text()).slice(0, 3500); // HARD CAP
 }
 
-function pickUrls(siteBaseUrl, preset) {
-  const base = (siteBaseUrl || "https://vation.com").replace(/\/+$/, "");
+function buildPrompt(preset) {
+  switch (preset) {
+    case "cx":
+      return `Summarize Vation's Customer Experience services.
+Rules:
+- Max 80 words
+- Clear business language
+- No assumptions
+- Use only provided content`;
 
-  // Keep it SMALL for quota control.
-  // You can add more URLs later once the team takes over.
-  const urlsByPreset = {
-    core: [
-      `${base}/`,
-      `${base}/solutions/`,
-      `${base}/offerings/`,
-    ],
-    cx: [
-      `${base}/solutions/customer-experience/`,
-      `${base}/solutions/`,
-    ],
-    ex: [
-      `${base}/solutions/employee-experience/`,
-      `${base}/solutions/`,
-    ],
-  };
+    case "ex":
+      return `Summarize Vation's Employee Experience services.
+Rules:
+- Max 80 words
+- Clear business language
+- No assumptions
+- Use only provided content`;
 
-  return urlsByPreset[preset] || urlsByPreset.core;
-}
-
-async function fetchPageText(url, timeoutMs = 9000) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const r = await fetch(url, {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (OmniOne POC Bot)",
-        "Accept": "text/html,application/xhtml+xml",
-      },
-      signal: controller.signal,
-    });
-
-    if (!r.ok) throw new Error(`Fetch failed ${r.status} for ${url}`);
-    const html = await r.text();
-    const text = stripHtml(html);
-
-    // Keep each page VERY small and cheap.
-    // (This is the #1 lever to reduce quota burn.)
-    return text.slice(0, 2600);
-  } finally {
-    clearTimeout(t);
+    default:
+      return `In max 80 words, explain what Vation does as a company.
+Rules:
+- Clear, factual
+- No marketing fluff
+- Use only provided content`;
   }
 }
 
-function buildPrompt({ preset, userQuestion }) {
-  // Hard rule: short outputs only (prevents quota burn).
-  // Also force structure so it looks “product-grade” in demo.
-  const baseRules = `
-You are an AI website search assistant.
-You MUST answer ONLY using the WEBSITE EXCERPTS provided.
-If something is not present in excerpts, say: "Not stated on the provided pages."
-
-Output format rules (STRICT):
-- Max 120 words total
-- First line: 1 short headline sentence
-- Then exactly 5 bullets (start each bullet with "- ")
-- No extra sections, no links in the answer
-- No marketing fluff, keep it factual
-`;
-
-  if (preset === "cx") {
-    return `${baseRules}
-User question: "Summarize Vation's Customer Experience (CX) capabilities."
-`;
-  }
-
-  if (preset === "ex") {
-    return `${baseRules}
-User question: "Summarize Vation's Employee Experience (EX) capabilities."
-`;
-  }
-
-  return `${baseRules}
-User question: "${userQuestion}"
-`;
-}
-
-async function callGemini({ apiKey, model, prompt, sourcesText }) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+async function callGemini({ apiKey, prompt, content }) {
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
+    apiKey;
 
   const body = {
     contents: [
       {
         role: "user",
-        parts: [
-          {
-            text:
-              `${prompt}\n\n` +
-              `WEBSITE EXCERPTS (GROUND TRUTH):\n` +
-              sourcesText,
-          },
-        ],
+        parts: [{ text: `${prompt}\n\nCONTENT:\n${content}` }],
       },
     ],
     generationConfig: {
       temperature: 0.2,
-      topP: 0.8,
-      // Keep output short and cheap:
-      maxOutputTokens: 180,
+      maxOutputTokens: 160,
     },
   };
 
@@ -172,73 +79,65 @@ async function callGemini({ apiKey, model, prompt, sourcesText }) {
     body: JSON.stringify(body),
   });
 
-  const json = await r.json().catch(() => ({}));
+  const j = await r.json();
+  if (!r.ok) throw new Error(j?.error?.message || "Gemini error");
 
-  if (!r.ok) {
-    const msg = json?.error?.message || `Gemini HTTP ${r.status}`;
-    const err = new Error(msg);
-    err.status = r.status;
-    err.code = json?.error?.code || r.status;
-    throw err;
-  }
-
-  const text =
-    json?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("")?.trim() ||
-    "";
-
-  if (!text) throw new Error("Empty Gemini response");
-  return text;
-}
-
-async function callGeminiWithRetry(args) {
-  try {
-    return await callGemini(args);
-  } catch (e) {
-    const status = e?.status || 0;
-    if (status === 429 || status >= 500) {
-      await new Promise((r) => setTimeout(r, 1200));
-      return await callGemini(args);
-    }
-    throw e;
-  }
+  return (
+    j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ||
+    ""
+  );
 }
 
 export default async function handler(req, res) {
-  setCors(res);
-
-  // OPTIONS preflight for browser/Tampermonkey
-  if (req.method === "OPTIONS") {
-    res.statusCode = 204;
-    return res.end();
-  }
-
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST, OPTIONS");
-    return safeJson(res, 405, { error: "Method not allowed. Use POST." });
-  }
+  if (req.method !== "POST")
+    return json(res, 405, { error: "POST only" });
 
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return safeJson(res, 500, { error: "Missing GEMINI_API_KEY in Vercel env vars." });
+  if (!apiKey)
+    return json(res, 500, { error: "Missing GEMINI_API_KEY" });
+
+  const { preset = "core", siteBaseUrl = "https://vation.com" } =
+    typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+  const cacheKey = preset;
+  if (CACHE.has(cacheKey)) {
+    const hit = CACHE.get(cacheKey);
+    if (Date.now() - hit.ts < TTL)
+      return json(res, 200, { ...hit.data, cached: true });
   }
 
-  let body = {};
   try {
-    body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-  } catch {
-    return safeJson(res, 400, { error: "Invalid JSON body." });
+    const pageMap = {
+      core: `${siteBaseUrl}/`,
+      cx: `${siteBaseUrl}/solutions/customer-experience/`,
+      ex: `${siteBaseUrl}/solutions/employee-experience/`,
+    };
+
+    const pageUrl = pageMap[preset] || pageMap.core;
+    const content = await fetchPage(pageUrl);
+    const prompt = buildPrompt(preset);
+
+    const answer = await callGemini({
+      apiKey,
+      prompt,
+      content,
+    });
+
+    const payload = {
+      answer,
+      sources: [{ title: pageUrl, url: pageUrl }],
+      model: "gemini-2.0-flash",
+      preset,
+    };
+
+    CACHE.set(cacheKey, { ts: Date.now(), data: payload });
+    return json(res, 200, payload);
+  } catch (e) {
+    return json(res, 200, {
+      answer:
+        "Gemini could not generate a response for this request. Please retry with a fresh API key.",
+      sources: [],
+      error: e.message,
+    });
   }
-
-  const question = (body.question || "").trim();
-  const siteBaseUrl = (body.siteBaseUrl || "https://vation.com").trim();
-
-  if (!question) return safeJson(res, 400, { error: "Missing 'question'." });
-
-  // Use a model that exists in AI Studio for you.
-  // If you see "Gemini 2.0 Flash" / "Flash latest", this is the safest default:
-  const model = (body.model || "gemini-2.0-flash").trim();
-
-  const preset = detectPreset(question, body.preset);
-  const urls = pickUrls(siteBaseUrl, preset);
-
-  // Cache prevents repeated cli
+}
