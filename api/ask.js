@@ -1,6 +1,8 @@
-// /api/ask.js
+// api/ask.js
+// Vation AI Search POC - Gemini grounded summarizer with tight quota controls
+
 export default async function handler(req, res) {
-  // ---- CORS (so browser fetch tests don't explode) ----
+  // --- CORS (so browser fetch also works if needed later) ---
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -12,193 +14,242 @@ export default async function handler(req, res) {
 
   try {
     const { question, siteBaseUrl } = req.body || {};
-    const q = (question || "").trim();
-    const base = (siteBaseUrl || "").trim();
-
-    if (!q || !base) {
+    if (!question || !siteBaseUrl) {
       return res.status(400).json({ error: "Missing question or siteBaseUrl" });
     }
 
-    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({ error: "Missing GEMINI_API_KEY in Vercel env" });
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
     }
 
-    // Prefer what you actually see in AI Studio
-    const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+    // Pick a model that your key actually supports.
+    // You said AI Studio shows “Gemini 2.0 Flash / Flash latest” etc.
+    // So default to gemini-2.0-flash unless you override with env.
+    const model =
+      process.env.GEMINI_MODEL ||
+      "gemini-2.0-flash";
 
-    // ---- Choose 1-2 most relevant pages ONLY (cheap) ----
-    const { targets, label } = pickTargets(q, base);
+    // Hard caps to avoid burning quota
+    const MAX_PAGES = 4;              // keep small
+    const MAX_CHARS_PER_PAGE = 2200;  // keep small
+    const MAX_OUTPUT_TOKENS = 220;    // ~150-180 words max
+    const REQUEST_TIMEOUT_MS = 12000;
 
-    // ---- Fetch only those pages ----
+    // 1) Fetch a small set of useful pages (cheap “site index”)
+    // Keep it deterministic and small: homepage + CX + EX + About/Culture.
+    const candidatePaths = [
+      "/",
+      "/solutions/customer-experience/",
+      "/solutions/employee-experience/",
+      "/about-vation/",
+      "/our-culture/",
+    ];
+
     const pages = [];
-    for (const url of targets) {
-      const html = await safeFetchText(url);
-      if (html) {
+    for (const p of candidatePaths) {
+      if (pages.length >= MAX_PAGES) break;
+      const url = new URL(p, siteBaseUrl).toString();
+      const text = await fetchPageText(url, REQUEST_TIMEOUT_MS);
+      if (text) {
         pages.push({
           url,
-          text: extractUsefulText(html, 5500) // cap raw text per page
+          title: guessTitle(text) || url,
+          snippet: text.slice(0, MAX_CHARS_PER_PAGE),
         });
       }
     }
 
-    // Build minimal context
-    const sources = pages.map(p => ({ url: p.url }));
-    const contextBlock = pages
-      .map((p, i) => `SOURCE ${i + 1}: ${p.url}\n${p.text}`)
-      .join("\n\n");
+    // If we couldn’t fetch anything, fail cleanly.
+    if (!pages.length) {
+      return res.status(200).json({
+        answer:
+          "I couldn’t fetch public content from the website right now. Please try again or check if the site is blocking automated access.",
+        sources: [],
+      });
+    }
 
-    // ---- Strict, small-output prompt ----
-    const maxWords = 120;
-    const prompt = [
-      `You are an AI website search assistant for Vation.`,
-      `Task: Answer the user question using ONLY the sources provided.`,
-      `Output rules:`,
-      `- Max ${maxWords} words total.`,
-      `- Use simple business language.`,
-      `- If info is not in sources, say: "Not found on the provided pages."`,
-      `- Do NOT mention tokens, rate limits, or internal errors.`,
-      ``,
-      `User question: ${normalizeQuestion(q, label)}`,
-      ``,
-      `Sources:\n${contextBlock}`
-    ].join("\n");
+    // 2) Build a very tight prompt (forces word cap + bullets)
+    const systemInstruction =
+      "You are a website-grounded assistant. Use ONLY the provided page snippets as evidence. " +
+      "Do not invent details. If something is not in the snippets, say 'Not stated on the provided pages.'";
 
-    // ---- Gemini call ----
-    const geminiResponse = await callGemini({
-      apiKey: GEMINI_API_KEY,
-      model: MODEL,
-      prompt
+    const userInstruction =
+      "Answer the user question using ONLY the snippets.\n" +
+      "Output format:\n" +
+      "- First line: 1-sentence direct answer.\n" +
+      "- Then: 5 bullet points (short).\n" +
+      "- Word limit: 120 words max.\n\n" +
+      `Question: ${question}\n\n` +
+      "Snippets:\n" +
+      pages
+        .map((p, i) => `[#${i + 1}] ${p.url}\n${p.snippet}\n`)
+        .join("\n");
+
+    // 3) Call Gemini with ONE retry (so demo gets at least one success)
+    const geminiResponse = await callGeminiWithRetry({
+      apiKey,
+      model,
+      systemInstruction,
+      userInstruction,
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      retries: 1, // important
     });
 
-    // Final guard: hard-trim to word limit (still "Gemini answer" but capped)
-    const answer = enforceWordLimit(geminiResponse || "", maxWords) || "Not found on the provided pages.";
+    // If Gemini still fails, return a strong message (no “weak” wording)
+    if (!geminiResponse.ok) {
+      return res.status(200).json({
+        answer:
+          "The AI service is busy right now. Please try again in 30 seconds. (This is a temporary quota/traffic limit.)",
+        sources: pages.map((p) => ({ title: p.title, url: p.url })),
+      });
+    }
 
-    return res.status(200).json({ answer, sources });
+    return res.status(200).json({
+      answer: geminiResponse.text,
+      sources: pages.map((p) => ({ title: p.title, url: p.url })),
+      modelUsed: model,
+    });
   } catch (err) {
-    // Strong fallback (no "weak" message)
     return res.status(200).json({
       answer:
-        "I couldn’t generate a grounded summary right now. Please try again once. If it repeats, it’s likely an API configuration or rate limit issue.",
-      sources: []
+        "Something went wrong while generating the answer. Please retry once.",
+      sources: [],
+      debug: String(err?.message || err),
     });
   }
 }
 
-/* ---------------- Helpers ---------------- */
-
-function pickTargets(question, base) {
-  const q = question.toLowerCase();
-
-  // 3 curated intents: Core / CX / EX (you asked exactly this)
-  if (q.includes("customer experience") || q.includes(" cx ") || q.includes("cx")) {
-    return {
-      label: "CX",
-      targets: [
-        joinUrl(base, "/solutions/customer-experience/"),
-        joinUrl(base, "/") // home as backup
-      ]
-    };
-  }
-  if (q.includes("employee experience") || q.includes(" ex ") || q.includes("ex")) {
-    return {
-      label: "EX",
-      targets: [
-        joinUrl(base, "/solutions/employee-experience/"),
-        joinUrl(base, "/") // home as backup
-      ]
-    };
-  }
-
-  // Core offerings
-  return {
-    label: "CORE",
-    targets: [
-      joinUrl(base, "/"),
-      joinUrl(base, "/solutions/") // if exists, great; if 404, it's ok
-    ]
-  };
-}
-
-function normalizeQuestion(q, label) {
-  // Force concise questions (prevents users typing essays)
-  if (label === "CX") return "Summarize Vation’s Customer Experience (CX) capabilities in 5 bullet points.";
-  if (label === "EX") return "Summarize Vation’s Employee Experience (EX) capabilities in 5 bullet points.";
-  return "Summarize Vation’s core offerings in 5 bullet points.";
-}
-
-function joinUrl(base, path) {
-  const b = base.replace(/\/+$/, "");
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return `${b}${p}`;
-}
-
-async function safeFetchText(url) {
+async function fetchPageText(url, timeoutMs) {
   try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+
     const r = await fetch(url, {
       method: "GET",
-      headers: { "User-Agent": "Mozilla/5.0" }
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (compatible; VationSearchPOC/1.0; +https://vation.com)",
+      },
     });
+
+    clearTimeout(t);
     if (!r.ok) return "";
-    const t = await r.text();
-    return t || "";
+
+    const html = await r.text();
+    const text = stripHtml(html);
+    return compact(text);
   } catch {
     return "";
   }
 }
 
-function extractUsefulText(html, maxChars = 6000) {
-  // remove scripts/styles
-  let text = html
+function stripHtml(html) {
+  // Very lightweight HTML -> text
+  return html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<\/?(?:svg|path|img|video|audio|canvas)[^>]*>/gi, " ")
+    .replace(/<\/(p|div|br|li|h1|h2|h3|h4|h5)>/gi, "\n")
     .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // keep only first N chars to stay cheap
-  if (text.length > maxChars) text = text.slice(0, maxChars);
-  return text;
+    .replace(/\s+/g, " ");
 }
 
-async function callGemini({ apiKey, model, prompt }) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+function compact(text) {
+  return (text || "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
-  const body = {
+function guessTitle(text) {
+  // crude: take first 60 chars
+  if (!text) return "";
+  return text.slice(0, 60).trim();
+}
+
+async function callGeminiWithRetry({
+  apiKey,
+  model,
+  systemInstruction,
+  userInstruction,
+  maxOutputTokens,
+  timeoutMs,
+  retries,
+}) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      model
+    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const payload = {
     contents: [
       {
         role: "user",
-        parts: [{ text: prompt }]
-      }
+        parts: [{ text: userInstruction }],
+      },
     ],
+    systemInstruction: {
+      parts: [{ text: systemInstruction }],
+    },
     generationConfig: {
       temperature: 0.2,
-      maxOutputTokens: 220 // small output cap
-    }
+      maxOutputTokens,
+    },
   };
 
-  const r = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const result = await callOnce(url, payload, timeoutMs);
+    if (result.ok) return result;
 
-  if (!r.ok) {
-    // throw to fallback handler
-    throw new Error(`Gemini HTTP ${r.status}`);
+    // Only retry on 429/503-like situations
+    if (!String(result.status).startsWith("429") && result.status !== 503) {
+      return result;
+    }
+
+    // Backoff a bit
+    await sleep(900 + attempt * 700);
   }
 
-  const json = await r.json();
-  const txt =
-    json?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") ||
-    "";
-  return (txt || "").trim();
+  return { ok: false, status: 429, text: "" };
 }
 
-function enforceWordLimit(text, maxWords) {
-  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
-  if (words.length <= maxWords) return words.join(" ");
-  return words.slice(0, maxWords).join(" ") + "…";
+async function callOnce(url, payload, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    clearTimeout(t);
+
+    const json = await r.json().catch(() => ({}));
+
+    if (!r.ok) {
+      return {
+        ok: false,
+        status: r.status,
+        text: "",
+        raw: json,
+      };
+    }
+
+    const text =
+      json?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
+
+    return { ok: true, status: 200, text: text.trim(), raw: json };
+  } catch (e) {
+    clearTimeout(t);
+    return { ok: false, status: 503, text: "", raw: String(e?.message || e) };
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
