@@ -177,7 +177,8 @@ async function askGemini(question, docs) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return "Gemini API key missing on server.";
 
-  const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const model = "gemini-1.5-flash";
+
 
   const systemRules = `
 You are an AI website search assistant for vation.com.
