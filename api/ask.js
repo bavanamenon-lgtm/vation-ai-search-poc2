@@ -1,255 +1,273 @@
 // api/ask.js
-// Vation AI Search POC - Gemini grounded summarizer with tight quota controls
+// Vation AI Search POC - backend
+// - Crawls a few public pages from siteBaseUrl
+// - Sends a SMALL grounded snippet set to Gemini
+// - Caches responses to reduce quota burn
+// - Retry once on 429/5xx
 
-export default async function handler(req, res) {
-  // --- CORS (so browser fetch also works if needed later) ---
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
+const CACHE = new Map(); // in-memory (good enough for POC). Key => {ts, data}
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method Not Allowed" });
-  }
-
-  try {
-    const { question, siteBaseUrl } = req.body || {};
-    if (!question || !siteBaseUrl) {
-      return res.status(400).json({ error: "Missing question or siteBaseUrl" });
-    }
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
-    }
-
-    // Pick a model that your key actually supports.
-    // You said AI Studio shows “Gemini 2.0 Flash / Flash latest” etc.
-    // So default to gemini-2.0-flash unless you override with env.
-    const model =
-      process.env.GEMINI_MODEL ||
-      "gemini-2.0-flash";
-
-    // Hard caps to avoid burning quota
-    const MAX_PAGES = 4;              // keep small
-    const MAX_CHARS_PER_PAGE = 2200;  // keep small
-    const MAX_OUTPUT_TOKENS = 220;    // ~150-180 words max
-    const REQUEST_TIMEOUT_MS = 12000;
-
-    // 1) Fetch a small set of useful pages (cheap “site index”)
-    // Keep it deterministic and small: homepage + CX + EX + About/Culture.
-    const candidatePaths = [
-      "/",
-      "/solutions/customer-experience/",
-      "/solutions/employee-experience/",
-      "/about-vation/",
-      "/our-culture/",
-    ];
-
-    const pages = [];
-    for (const p of candidatePaths) {
-      if (pages.length >= MAX_PAGES) break;
-      const url = new URL(p, siteBaseUrl).toString();
-      const text = await fetchPageText(url, REQUEST_TIMEOUT_MS);
-      if (text) {
-        pages.push({
-          url,
-          title: guessTitle(text) || url,
-          snippet: text.slice(0, MAX_CHARS_PER_PAGE),
-        });
-      }
-    }
-
-    // If we couldn’t fetch anything, fail cleanly.
-    if (!pages.length) {
-      return res.status(200).json({
-        answer:
-          "I couldn’t fetch public content from the website right now. Please try again or check if the site is blocking automated access.",
-        sources: [],
-      });
-    }
-
-    // 2) Build a very tight prompt (forces word cap + bullets)
-    const systemInstruction =
-      "You are a website-grounded assistant. Use ONLY the provided page snippets as evidence. " +
-      "Do not invent details. If something is not in the snippets, say 'Not stated on the provided pages.'";
-
-    const userInstruction =
-      "Answer the user question using ONLY the snippets.\n" +
-      "Output format:\n" +
-      "- First line: 1-sentence direct answer.\n" +
-      "- Then: 5 bullet points (short).\n" +
-      "- Word limit: 120 words max.\n\n" +
-      `Question: ${question}\n\n` +
-      "Snippets:\n" +
-      pages
-        .map((p, i) => `[#${i + 1}] ${p.url}\n${p.snippet}\n`)
-        .join("\n");
-
-    // 3) Call Gemini with ONE retry (so demo gets at least one success)
-    const geminiResponse = await callGeminiWithRetry({
-      apiKey,
-      model,
-      systemInstruction,
-      userInstruction,
-      maxOutputTokens: MAX_OUTPUT_TOKENS,
-      timeoutMs: REQUEST_TIMEOUT_MS,
-      retries: 1, // important
-    });
-
-    // If Gemini still fails, return a strong message (no “weak” wording)
-    if (!geminiResponse.ok) {
-      return res.status(200).json({
-        answer:
-          "The AI service is busy right now. Please try again in 30 seconds. (This is a temporary quota/traffic limit.)",
-        sources: pages.map((p) => ({ title: p.title, url: p.url })),
-      });
-    }
-
-    return res.status(200).json({
-      answer: geminiResponse.text,
-      sources: pages.map((p) => ({ title: p.title, url: p.url })),
-      modelUsed: model,
-    });
-  } catch (err) {
-    return res.status(200).json({
-      answer:
-        "Something went wrong while generating the answer. Please retry once.",
-      sources: [],
-      debug: String(err?.message || err),
-    });
-  }
+function now() {
+  return Date.now();
 }
 
-async function fetchPageText(url, timeoutMs) {
-  try {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-
-    const r = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (compatible; VationSearchPOC/1.0; +https://vation.com)",
-      },
-    });
-
-    clearTimeout(t);
-    if (!r.ok) return "";
-
-    const html = await r.text();
-    const text = stripHtml(html);
-    return compact(text);
-  } catch {
-    return "";
+function cacheGet(key) {
+  const hit = CACHE.get(key);
+  if (!hit) return null;
+  if (now() - hit.ts > CACHE_TTL_MS) {
+    CACHE.delete(key);
+    return null;
   }
+  return hit.data;
+}
+
+function cacheSet(key, data) {
+  CACHE.set(key, { ts: now(), data });
+}
+
+function safeJson(res, status, obj) {
+  res.status(status).setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(obj));
 }
 
 function stripHtml(html) {
-  // Very lightweight HTML -> text
+  if (!html) return "";
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<\/(p|div|br|li|h1|h2|h3|h4|h5)>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ");
-}
-
-function compact(text) {
-  return (text || "")
-    .replace(/\s{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
+    .replace(/<\/?[^>]+(>|$)/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-function guessTitle(text) {
-  // crude: take first 60 chars
-  if (!text) return "";
-  return text.slice(0, 60).trim();
+function pickUrls(siteBaseUrl, preset) {
+  const base = siteBaseUrl.replace(/\/+$/, "");
+  const urls = {
+    core: [
+      `${base}/`,
+      `${base}/solutions/`,
+      `${base}/offerings/`,
+    ],
+    cx: [
+      `${base}/solutions/customer-experience/`,
+      `${base}/`,
+    ],
+    ex: [
+      `${base}/solutions/employee-experience/`,
+      `${base}/`,
+    ],
+  };
+  return urls[preset] || urls.core;
 }
 
-async function callGeminiWithRetry({
-  apiKey,
-  model,
-  systemInstruction,
-  userInstruction,
-  maxOutputTokens,
-  timeoutMs,
-  retries,
-}) {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      model
-    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+async function fetchPageText(url) {
+  const r = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (POC Bot; +https://vation.com)",
+      "Accept": "text/html,application/xhtml+xml",
+    },
+  });
+  if (!r.ok) throw new Error(`Fetch failed ${r.status} for ${url}`);
+  const html = await r.text();
+  const text = stripHtml(html);
+  // Keep it small: take first ~4500 chars from each page (enough for Gemini)
+  return text.slice(0, 4500);
+}
 
-  const payload = {
+function buildPrompt({ question, preset }) {
+  // Hard cap answer size to protect quota + keep demo clean.
+  // Also forces structure so it looks like Rightpoint-style.
+  if (preset === "cx") {
+    return `You are an AI website search assistant. Answer ONLY using the provided website excerpts.
+Question: "What does Vation offer in Customer Experience (CX)?"
+Output rules:
+- Max 120 words total
+- 1 short headline line, then exactly 5 bullet points
+- If info is missing, say "Not stated on the provided pages" in that bullet.
+Do not add external knowledge.`;
+  }
+  if (preset === "ex") {
+    return `You are an AI website search assistant. Answer ONLY using the provided website excerpts.
+Question: "What does Vation offer in Employee Experience (EX)?"
+Output rules:
+- Max 120 words total
+- 1 short headline line, then exactly 5 bullet points
+- If info is missing, say "Not stated on the provided pages" in that bullet.
+Do not add external knowledge.`;
+  }
+  // core
+  return `You are an AI website search assistant. Answer ONLY using the provided website excerpts.
+User question: "${question}"
+Output rules:
+- Max 120 words total
+- 1 short headline line, then exactly 5 bullet points
+- No marketing fluff; keep it factual.
+- Do not add external knowledge.`;
+}
+
+async function callGemini({ apiKey, model, prompt, sourcesText }) {
+  // Google AI Studio (Generative Language API) style endpoint.
+  // If your key is from AI Studio, this is typically correct.
+  // Model should be one you see: e.g., "gemini-2.0-flash"
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const body = {
     contents: [
       {
         role: "user",
-        parts: [{ text: userInstruction }],
+        parts: [
+          {
+            text:
+              `${prompt}\n\n` +
+              `WEBSITE EXCERPTS (ground truth):\n` +
+              sourcesText,
+          },
+        ],
       },
     ],
-    systemInstruction: {
-      parts: [{ text: systemInstruction }],
-    },
     generationConfig: {
       temperature: 0.2,
-      maxOutputTokens,
+      topP: 0.8,
+      maxOutputTokens: 220, // keeps output short and cheap
     },
   };
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const result = await callOnce(url, payload, timeoutMs);
-    if (result.ok) return result;
+  const r = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
-    // Only retry on 429/503-like situations
-    if (!String(result.status).startsWith("429") && result.status !== 503) {
-      return result;
-    }
-
-    // Backoff a bit
-    await sleep(900 + attempt * 700);
+  const json = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = json?.error?.message || `Gemini HTTP ${r.status}`;
+    const code = json?.error?.code || r.status;
+    const err = new Error(msg);
+    err.status = r.status;
+    err.code = code;
+    throw err;
   }
 
-  return { ok: false, status: 429, text: "" };
+  const text =
+    json?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("")?.trim() ||
+    "";
+
+  if (!text) throw new Error("Empty Gemini response");
+  return text;
 }
 
-async function callOnce(url, payload, timeoutMs) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
+async function callGeminiWithRetry(args) {
   try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
+    return await callGemini(args);
+  } catch (e) {
+    // Retry once for rate limit / transient errors
+    const status = e?.status || 0;
+    if (status === 429 || status >= 500) {
+      await new Promise((r) => setTimeout(r, 1200));
+      return await callGemini(args);
+    }
+    throw e;
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return safeJson(res, 405, { error: "Method not allowed. Use POST." });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return safeJson(res, 500, { error: "Missing GEMINI_API_KEY in Vercel environment variables." });
+  }
+
+  let body = {};
+  try {
+    body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+  } catch {
+    return safeJson(res, 400, { error: "Invalid JSON body." });
+  }
+
+  const question = (body.question || "").trim();
+  const siteBaseUrl = (body.siteBaseUrl || "https://vation.com").trim();
+  const preset = (body.preset || "").trim().toLowerCase(); // "core" | "cx" | "ex"
+
+  if (!question) {
+    return safeJson(res, 400, { error: "Missing 'question'." });
+  }
+
+  // Use a model that you actually see in AI Studio
+  // (You said you see Gemini 2.0 Flash / Flash Latest)
+  const model = (body.model || "gemini-2.0-flash").trim();
+
+  // Cache key: prevents repeated burn when you click buttons repeatedly
+  const cacheKey = JSON.stringify({ question, siteBaseUrl, preset, model });
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    return safeJson(res, 200, { ...cached, cached: true });
+  }
+
+  // Pick a SMALL set of pages to keep quota low
+  const urls = pickUrls(siteBaseUrl, preset || "core");
+
+  let sources = [];
+  try {
+    const texts = await Promise.all(
+      urls.map(async (u) => {
+        const t = await fetchPageText(u);
+        return { url: u, text: t };
+      })
+    );
+
+    // Build compact “sourcesText” for Gemini
+    const sourcesText = texts
+      .map((p, i) => `SOURCE ${i + 1}: ${p.url}\n${p.text}\n`)
+      .join("\n")
+      .slice(0, 12000); // hard cap total input text
+
+    const prompt = buildPrompt({ question, preset });
+
+    const answer = await callGeminiWithRetry({
+      apiKey,
+      model,
+      prompt,
+      sourcesText,
     });
 
-    clearTimeout(t);
+    sources = texts.map((t) => ({ title: t.url, url: t.url }));
 
-    const json = await r.json().catch(() => ({}));
+    const payload = { answer, sources, model, preset: preset || "core" };
+    cacheSet(cacheKey, payload);
+    return safeJson(res, 200, payload);
+  } catch (e) {
+    // Do NOT show weak messages. Keep it professional for demo.
+    const status = e?.status || 500;
+    const code = e?.code || status;
+    const msg = (e?.message || "").toString();
 
-    if (!r.ok) {
-      return {
-        ok: false,
-        status: r.status,
-        text: "",
-        raw: json,
-      };
+    // If Gemini is rate-limited, return a crisp directive (not apologetic).
+    if (status === 429 || String(code).includes("429")) {
+      return safeJson(res, 200, {
+        answer:
+          "The AI is currently throttled by the model provider for this key. Please retry once after ~30 seconds, or switch to a fresh API key for the demo run.",
+        sources: urls.map((u) => ({ title: u, url: u })),
+        model,
+        preset: preset || "core",
+        error: { code: 429, message: "Rate limited" },
+      });
     }
 
-    const text =
-      json?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
-
-    return { ok: true, status: 200, text: text.trim(), raw: json };
-  } catch (e) {
-    clearTimeout(t);
-    return { ok: false, status: 503, text: "", raw: String(e?.message || e) };
+    return safeJson(res, 200, {
+      answer:
+        "AI summary could not be generated for this request. Please retry, or confirm the model name and API key permissions in Google AI Studio.",
+      sources: urls.map((u) => ({ title: u, url: u })),
+      model,
+      preset: preset || "core",
+      error: { code, message: msg || "Unknown error" },
+    });
   }
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
